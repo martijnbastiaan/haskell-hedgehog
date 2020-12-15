@@ -6,9 +6,11 @@
 {-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Hedgehog.Internal.Report (
   -- * Report
@@ -35,6 +37,8 @@ module Hedgehog.Internal.Report (
   , mkFailure
   ) where
 
+import           Control.Applicative ((<|>))
+import           Control.Exception (SomeException, try)
 import           Control.Monad (zipWithM)
 import           Control.Monad.IO.Class (MonadIO(..))
 import           Control.Monad.Trans.Maybe (MaybeT(..))
@@ -46,6 +50,7 @@ import qualified Data.List as List
 import           Data.Map (Map)
 import qualified Data.Map as Map
 import           Data.Maybe (mapMaybe, catMaybes)
+import           Data.List.Split (splitOn)
 import           Data.Traversable (for)
 
 import           Hedgehog.Internal.Config
@@ -68,7 +73,10 @@ import           Hedgehog.Range (Size)
 import           System.Console.ANSI (ColorIntensity(..), Color(..))
 import           System.Console.ANSI (ConsoleLayer(..), ConsoleIntensity(..))
 import           System.Console.ANSI (SGR(..), setSGRCode)
-import           System.Directory (makeRelativeToCurrentDirectory)
+import qualified System.Directory as Directory
+import qualified System.Environment as Environment
+import           System.FilePath ((</>))
+import qualified System.Info as Info
 
 #if mingw32_HOST_OS
 import           System.IO (hSetEncoding, stdout, stderr, utf8)
@@ -77,6 +85,8 @@ import           System.IO (hSetEncoding, stdout, stderr, utf8)
 import           Text.PrettyPrint.Annotated.WL (Doc, (<#>), (<+>))
 import qualified Text.PrettyPrint.Annotated.WL as WL
 import           Text.Printf (printf)
+
+import Debug.Trace
 
 ------------------------------------------------------------------------
 -- Data
@@ -379,10 +389,84 @@ takeLines sloc =
   snd . Map.split (spanStartLine sloc - 1) .
   declarationSource
 
+-- | Find source file pointed to in 'Span'. Searches in:
+--
+--    * Data-files of package, if stored in ~/.cabal
+--    * Data-files of package, if this binary is run with Stack
+--    * Current working directory
+--    * The closest cabal project when traversing up from the current working
+--      directory
+--
+findSpanFile :: MonadIO m => Span -> m (Maybe FilePath)
+findSpanFile sloc = liftIO (List.foldl' (<|>) Nothing <$> spanFiles)
+ where
+  spanFiles = do
+    cwd <- Directory.getCurrentDirectory
+    sequence
+      [ fromCabalPackage
+      , fromStackPackage
+      , fromCwd
+      , fromCabalOrStackProject cwd ]
+
+  -- Try to read from data-files supplied in installed package
+  fromCabalPackage = do
+    sf <- fmap (</> spanFile sloc) (guessCabalShareDir (spanPackage sloc))
+    orNothing sf <$> Directory.doesFileExist sf
+
+  fromStackPackage = do
+    ghcPackagePath <- Environment.lookupEnv "GHC_PACKAGE_PATH"
+    stackExe <- Environment.lookupEnv "STACK_EXE"
+    case (ghcPackagePath, stackExe) of
+      (Just pp, Just _) ->
+        List.foldl' (<|>) Nothing <$>
+          mapM fromStackPackageDb (splitOn ":" pp)
+      _ -> pure Nothing
+   where
+    fromStackPackageDb :: String -> IO (Maybe FilePath)
+    fromStackPackageDb db = do
+      let
+        (x, y, z) = ghcVersion
+        ghcVer = "ghc-" <> show x <> show y <> show z
+        platform = Info.arch <> "-" <> Info.os <> "-" <> ghcVer
+        share = db </> ".." </> "share" </> platform </> spanPackage sloc
+        sf0 = share </> spanFile sloc
+
+      traceM sf0
+
+      sf1 <- Directory.canonicalizePath sf0
+      orNothing sf1 <$> Directory.doesFileExist sf1
+
+  -- Try to read from current working directory
+  fromCwd = do
+    sf <- Directory.makeRelativeToCurrentDirectory (spanFile sloc)
+    orNothing sf <$> Directory.doesFileExist sf
+
+  -- Try to find a cabal project in given directory, its parent, etc..
+  fromCabalOrStackProject wd = do
+    contents <- try @SomeException (Directory.listDirectory wd)
+    let
+      containsCabalFile =
+        case contents of
+          Left _ -> False
+          Right files ->
+            any (\f -> ".cabal" `List.isSuffixOf` f || f == "stack.yaml") files
+
+    parent <- Directory.canonicalizePath (wd </> "..")
+    if | containsCabalFile -> do
+           let sf = wd </> spanFile sloc
+           orNothing sf <$> Directory.doesFileExist sf
+       | parent == wd -> pure Nothing
+       | otherwise -> fromCabalOrStackProject parent
+
+  -- Helper. Put somewhere accessible?
+  orNothing :: b -> Bool -> Maybe b
+  orNothing b True = Just b
+  orNothing _ False = Nothing
+
 readDeclaration :: MonadIO m => Span -> m (Maybe (Declaration ()))
 readDeclaration sloc =
   runMaybeT $ do
-    path <- liftIO . makeRelativeToCurrentDirectory $ spanFile sloc
+    path <- MaybeT (findSpanFile sloc)
 
     (name, Pos (Position _ line0 _) src) <- MaybeT $
       Discovery.readDeclaration path (spanEndLine sloc)
