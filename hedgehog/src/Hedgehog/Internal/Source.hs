@@ -1,4 +1,5 @@
 {-# OPTIONS_HADDOCK not-home #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
@@ -15,11 +16,17 @@ module Hedgehog.Internal.Source (
   , HasCallStack
   , callStack
   , withFrozenCallStack
+  , guessCabalShareDir
+  , ghcVersion
   ) where
+
+import Data.Version (Version(versionBranch))
+import System.Directory (getAppUserDataDirectory)
+import System.Info (compilerVersion)
+import System.FilePath ((</>))
 
 import GHC.Stack (CallStack, HasCallStack, SrcLoc(..))
 import GHC.Stack (callStack, getCallStack, withFrozenCallStack)
-
 
 newtype LineNo =
   LineNo {
@@ -33,12 +40,31 @@ newtype ColumnNo =
 
 data Span =
   Span {
-      spanFile :: !FilePath
+      spanPackage :: !String
+    , spanFile :: !FilePath
     , spanStartLine :: !LineNo
     , spanStartColumn :: !ColumnNo
     , spanEndLine :: !LineNo
     , spanEndColumn :: !ColumnNo
     } deriving (Eq, Ord)
+
+guessCabalShareDir :: String -> IO FilePath
+guessCabalShareDir pkgName = do
+  cabalDir <- getAppUserDataDirectory "cabal"
+
+  let
+    (x, y, z) = ghcVersion
+    ghcVer = show x <> "." <> show y <> "." <> show z
+    storeDir = cabalDir </> "store" </> "ghc-" <> ghcVer
+    shareDir = storeDir </> pkgName </> "share"
+
+  pure shareDir
+
+ghcVersion :: HasCallStack => (Int, Int, Int)
+ghcVersion =
+  case versionBranch compilerVersion of
+    (x:y:_) -> (x, y, __GLASGOW_HASKELL_PATCHLEVEL1__)
+    vb -> error ("Unexpected branch in System.Info.compilerVersion: " <> show vb)
 
 getCaller :: CallStack -> Maybe Span
 getCaller stack =
@@ -47,6 +73,7 @@ getCaller stack =
       Nothing
     (_, x) : _ ->
       Just $ Span
+        (srcLocPackage x)
         (srcLocFile x)
         (fromIntegral $ srcLocStartLine x)
         (fromIntegral $ srcLocStartCol x)
@@ -57,9 +84,11 @@ getCaller stack =
 -- Show instances
 
 instance Show Span where
-  showsPrec p (Span file sl sc el ec) =
+  showsPrec p (Span pkg file sl sc el ec) =
     showParen (p > 10) $
       showString "Span " .
+      showsPrec 11 pkg .
+      showChar ' ' .
       showsPrec 11 file .
       showChar ' ' .
       showsPrec 11 sl .
